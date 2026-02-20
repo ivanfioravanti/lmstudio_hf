@@ -4,6 +4,104 @@ from pathlib import Path
 import sys
 import shutil
 
+
+def _cache_search_roots(cache_dir: Path):
+    """Return candidate roots that may contain Hugging Face cached repos."""
+    roots = [cache_dir]
+    hub_dir = cache_dir / "hub"
+    if hub_dir.exists():
+        roots.append(hub_dir)
+    return roots
+
+
+def _discover_hf_models(cache_dir: Path):
+    """Discover cached Hugging Face models limited to MLX or GGUF formats."""
+    found_models = set()
+
+    for root in _cache_search_roots(cache_dir):
+        for repo_dir in root.glob("models--*"):
+            if not repo_dir.is_dir():
+                continue
+
+            snapshots_dir = repo_dir / "snapshots"
+            if not snapshots_dir.exists():
+                continue
+
+            snapshot_path = None
+            model_type = None
+
+            repo_name = repo_dir.name.removeprefix("models--")
+            repo_name_lower = repo_name.lower()
+
+            for snapshot_dir in sorted(snapshots_dir.iterdir()):
+                if not snapshot_dir.is_dir():
+                    continue
+
+                # GGUF models are identified by .gguf weights in the snapshot tree.
+                if any(p.is_file() for p in snapshot_dir.rglob("*.gguf")):
+                    snapshot_path = snapshot_dir
+                    model_type = "gguf"
+                    break
+
+                # MLX models: either repo naming suggests MLX, or snapshot has
+                # MLX-like safetensors artifacts with no legacy framework weights.
+                config_candidates = [snapshot_dir / "config.json", *snapshot_dir.rglob("config.json")]
+                config_data = None
+                for config_path in config_candidates:
+                    if not config_path.exists():
+                        continue
+                    try:
+                        with open(config_path) as f:
+                            config_data = json.load(f)
+                        break
+                    except (json.JSONDecodeError, FileNotFoundError):
+                        continue
+
+                if not config_data:
+                    continue
+
+                has_safetensors = any(p.is_file() for p in snapshot_dir.rglob("*.safetensors"))
+                has_legacy_weights = any(
+                    p.is_file()
+                    for ext in ("*.bin", "*.pt", "*.pth", "*.ckpt", "*.h5", "*.msgpack")
+                    for p in snapshot_dir.rglob(ext)
+                )
+                is_mlx_repo = "mlx" in repo_name_lower
+                looks_like_mlx = is_mlx_repo or (has_safetensors and not has_legacy_weights)
+
+                if looks_like_mlx:
+                    base_type = str(config_data.get("model_type", "")).lower().strip()
+                    model_type = f"mlx:{base_type}" if base_type else "mlx"
+                    snapshot_path = snapshot_dir
+                    break
+
+            if not snapshot_path or not model_type:
+                continue
+
+            model_name = repo_name.replace("--", "/")
+            if model_name:
+                found_models.add((model_type, model_name, snapshot_path))
+
+    return found_models
+
+
+def _resolve_lm_studio_models_dir() -> Path:
+    """Return LM Studio models directory from settings, or fallback default."""
+    fallback = Path(os.path.expanduser("~/.cache/lm-studio/models"))
+    settings_path = Path(os.path.expanduser("~/.lmstudio/settings.json"))
+
+    try:
+        with settings_path.open() as f:
+            settings = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return fallback
+
+    configured_path = settings.get("downloadsFolder")
+    if not isinstance(configured_path, str) or not configured_path.strip():
+        return fallback
+
+    return Path(os.path.expanduser(configured_path))
+
 def select_models(model_choices):
     selected = [False] * len(model_choices)
     idx = 0
@@ -51,48 +149,16 @@ def get_key():
     return ch
 
 def manage_models():
-    "Import MLX models from the Hugging Face cache."
+    "Import MLX and GGUF models from the Hugging Face cache."
     cache_dir = Path(
         os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
     )
-    lm_studio_dir = Path(os.path.expanduser("~/.cache/lm-studio/models"))
-    
-    found_models = set()
-    for root, dirs, _ in os.walk(cache_dir):
-        for d in dirs:
-            if "mlx-community" in d:
-                model_dir = Path(root) / d
-                snapshots_dir = model_dir / "snapshots"
-                if not snapshots_dir.exists():
-                    continue
+    lm_studio_dir = _resolve_lm_studio_models_dir()
 
-                # Search for config.json in any subfolder under snapshots
-                config_found = False
-                snapshot_path = None
-                for config_root, _, config_files in os.walk(snapshots_dir):
-                    if "config.json" in config_files:
-                        config_path = Path(config_root) / "config.json"
-                        try:
-                            with open(config_path) as f:
-                                config = json.load(f)
-                                model_type = config.get("model_type", "").lower()
-                                config_found = True
-                                snapshot_path = Path(config_root)
-                                break
-                        except (json.JSONDecodeError, FileNotFoundError):
-                            continue
-
-                if not config_found or not snapshot_path:
-                    continue
-                    
-                parts = d.split("--")
-                model_name = "/".join(parts[1:])
-                if model_name:
-                    # Store model_type, model_name, and snapshot_path
-                    found_models.add((model_type, model_name, snapshot_path))
+    found_models = _discover_hf_models(cache_dir)
 
     if not found_models:
-        print("No MLX models found in Hugging Face cache")
+        print("No MLX or GGUF models found in Hugging Face cache")
         return
 
     # Create list of models with their current import status
@@ -107,6 +173,12 @@ def manage_models():
     # Show interactive selection menu
     selected = select_models(model_choices)
     print("\nImporting models...\n")
+
+    if not selected:
+        print("No models selected. Nothing to import.")
+        return
+
+    print(f"LM Studio models directory: {lm_studio_dir}")
     
     for display_name, model_name, is_imported, snapshot_path in selected:
         target_path = lm_studio_dir / f"{model_name}"
@@ -123,10 +195,14 @@ def manage_models():
         else:
             # Create parent directories and target directory
             target_path.mkdir(parents=True, exist_ok=True)
+            print(f"Importing {model_name}")
+            print(f"  HF snapshot source: {snapshot_path}")
+            print(f"  LM Studio target:  {target_path}")
             
             # Create symbolic links for all files in the snapshot directory
             for item in snapshot_path.iterdir():
                 link_path = target_path / item.name
+                print(f"  ln -s {item} {link_path}")
                 os.symlink(item, link_path)
             
             print(f"Imported {model_name} (symlinked files)")

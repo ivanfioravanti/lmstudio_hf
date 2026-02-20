@@ -50,12 +50,14 @@ uvx git+https://github.com/ivanfioravanti/lmstudio_hf
 
 1. The tool scans your Hugging Face cache directory (`~/.cache/huggingface` by default)
 2. Identifies MLX-compatible models (excluding specific types like Whisper, LLaVA, etc.)
-3. Creates symbolic links in the LM Studio models directory (`~/.cache/lm-studio/models`)
+3. Creates symbolic links in the LM Studio models directory configured in `~/.lmstudio/settings.json` (`downloadsFolder`)
 4. Allows for easy management of existing imports
 
 ## Environment Variables
 
 - `HF_HOME`: Optional. Set this to customize your Hugging Face cache location.
+
+If `downloadsFolder` is missing or unreadable, the tool falls back to `~/.cache/lm-studio/models`.
 
 ## Notes
 
